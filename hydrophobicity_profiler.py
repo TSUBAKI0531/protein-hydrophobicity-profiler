@@ -19,8 +19,8 @@ import requests
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import streamlit as st
+import streamlit.components.v1 as components
 from Bio import SeqIO
-from stmol import showmol
 import py3Dmol
 
 
@@ -298,7 +298,10 @@ def show_structure_3d(
 
     view.zoomTo()
     view.spin(False)
-    showmol(view, height=height, width=width)
+
+    # stmol を使わず streamlit.components.v1.html で直接レンダリング
+    html_str = view._make_html()
+    components.html(html_str, height=height, width=width, scrolling=False)
 
 
 # ============================================================

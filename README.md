@@ -65,5 +65,5 @@ FASTA input
 - BioPython — FASTA parsing (SeqIO)
 - NumPy — Vectorized sliding window (np.convolve)
 - Matplotlib — 2D visualization
-- py3Dmol / stmol — 3D molecular visualization
+- py3Dmol + streamlit.components — 3D molecular visualization
 - ESMFold API — AI-based structure prediction
