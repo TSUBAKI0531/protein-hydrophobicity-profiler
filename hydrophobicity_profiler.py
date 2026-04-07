@@ -14,6 +14,7 @@ Run:
 """
 
 import io
+import re
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
@@ -169,15 +170,23 @@ def per_residue_scores(
 
 
 # ============================================================
-# 3. ESMFold API Integration
+# 3. Structure Prediction API Integration
 # ============================================================
 
-ESMFOLD_URL = "https://api.esm.metaai.com/predict3d"
+# ESM Atlas API（Meta公式エンドポイント）
+ESMFOLD_URL = "https://api.esmatlas.com/foldSequence/v1/pdb/"
 MAX_ESMFOLD_LENGTH = 400  # ESMFold API の推奨上限
+
+# AlphaFold DB（UniProt ID から既存の予測構造を取得）
+ALPHAFOLD_DB_URL = "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
 
 
 def predict_structure_esmfold(sequence: str, timeout: int = 120) -> str | None:
     """ESMFold API を呼び出して PDB 文字列を取得する。
+
+    SSL証明書の問題が既知のため、以下の順にフォールバックする:
+      1. ESM Atlas API（通常接続）
+      2. ESM Atlas API（SSL検証スキップ）
 
     Args:
         sequence: アミノ酸配列（最大 400 残基推奨）
@@ -187,20 +196,72 @@ def predict_structure_esmfold(sequence: str, timeout: int = 120) -> str | None:
         PDB形式の文字列。失敗時は None。
     """
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    # --- 1st try: 通常のSSL検証あり ---
     try:
         response = requests.post(
             ESMFOLD_URL,
             data=sequence,
             headers=headers,
             timeout=timeout,
+            verify=True,
         )
         response.raise_for_status()
-        pdb_text = response.text
-        if "ATOM" in pdb_text:
-            return pdb_text
+        if "ATOM" in response.text:
+            return response.text
+    except requests.exceptions.SSLError:
+        # SSL証明書エラー → verify=False でリトライ
+        st.warning(
+            "ESM Atlas APIのSSL証明書に問題があるため、"
+            "SSL検証をスキップしてリトライします。"
+        )
+    except requests.exceptions.RequestException as e:
+        st.warning(f"ESMFold API (1st attempt): {e}")
+
+    # --- 2nd try: SSL検証スキップ ---
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        response = requests.post(
+            ESMFOLD_URL,
+            data=sequence,
+            headers=headers,
+            timeout=timeout,
+            verify=False,
+        )
+        response.raise_for_status()
+        if "ATOM" in response.text:
+            st.success("ESMFold API (SSL skip) で構造を取得しました。")
+            return response.text
+    except requests.exceptions.RequestException as e:
+        st.warning(f"ESMFold API (SSL skip): {e}")
+
+    return None
+
+
+def fetch_alphafold_structure(uniprot_id: str, timeout: int = 30) -> str | None:
+    """AlphaFold Protein Structure Database から既存の予測構造を取得する。
+
+    ESMFold APIが利用できない場合のフォールバック。
+    UniProt IDが必要（例: P07550）。
+
+    Args:
+        uniprot_id: UniProt accession（例: "P07550"）
+        timeout: タイムアウト秒数
+
+    Returns:
+        PDB形式の文字列。失敗時は None。
+    """
+    url = ALPHAFOLD_DB_URL.format(uniprot_id=uniprot_id)
+    try:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        if "ATOM" in response.text:
+            return response.text
         return None
     except requests.exceptions.RequestException as e:
-        st.error(f"ESMFold API error: {e}")
+        st.warning(f"AlphaFold DB error: {e}")
         return None
 
 
@@ -469,8 +530,8 @@ def render_sidebar() -> dict:
 
         st.divider()
 
-        st.subheader("3D Structure (ESMFold)")
-        enable_3d = st.checkbox("Enable ESMFold 3D prediction", value=False)
+        st.subheader("3D Structure")
+        enable_3d = st.checkbox("Enable 3D structure view", value=False)
         color_3d = st.radio(
             "3D color mode",
             ["score", "regions"],
@@ -491,7 +552,8 @@ def render_sidebar() -> dict:
             "**References**\n\n"
             "Kyte & Doolittle (1982) *J. Mol. Biol.* 157:105-132\n\n"
             "Hopp & Woods (1981) *PNAS* 78:3824-3828\n\n"
-            "Lin et al. (2023) ESMFold — *Science* 379:1123-1130"
+            "Lin et al. (2023) ESMFold — *Science* 379:1123-1130\n\n"
+            "Jumper et al. (2021) AlphaFold — *Nature* 596:583-589"
         )
 
     return {
@@ -572,7 +634,7 @@ def render_analysis(record, params: dict):
         if not params["enable_3d"]:
             st.info(
                 "3D構造表示を有効にするには、サイドバーの "
-                "**Enable ESMFold 3D prediction** をオンにしてください。"
+                "**Enable 3D structure view** をオンにしてください。"
             )
         else:
             # 配列長チェック
@@ -589,29 +651,91 @@ def render_analysis(record, params: dict):
             # PDB を session_state にキャッシュ（同一配列は再予測しない）
             cache_key = f"pdb_{hash(seq_for_fold)}"
 
+            # --- 構造取得: 3段階フォールバック ---
             if cache_key not in st.session_state:
-                with st.spinner("ESMFold で構造予測中...（最大2分程度）"):
+
+                # Stage 1: ESMFold API
+                with st.spinner("ESMFold API で構造予測中..."):
                     pdb_str = predict_structure_esmfold(seq_for_fold)
 
                 if pdb_str:
                     st.session_state[cache_key] = pdb_str
-                    st.success("構造予測が完了しました。")
+                    st.success("ESMFold で構造を取得しました。")
                 else:
-                    st.error(
-                        "ESMFold API から有効な構造を取得できませんでした。\n\n"
-                        "代わりに手動で PDB ファイルをアップロードできます。"
+                    st.warning(
+                        "ESMFold API から構造を取得できませんでした "
+                        "（SSL証明書の問題が既知です）。\n\n"
+                        "**代替手段:** 以下から構造を取得できます。"
                     )
 
-            # PDB アップロードフォールバック（API 失敗時 or 手動）
+            # Stage 2: AlphaFold DB（UniProt ID 入力）
+            if cache_key not in st.session_state:
+                st.markdown("---")
+                st.markdown("**🔄 代替 1: AlphaFold DB から取得**")
+                st.caption(
+                    "FASTAヘッダにUniProt IDが含まれる場合は自動検出します。"
+                    "手動入力も可能です（例: P07550）。"
+                )
+
+                # UniProt ID を FASTA ヘッダから自動抽出を試みる
+                auto_uniprot = ""
+                header = record.description or record.id or ""
+                # sp|P07550|ADRB2_HUMAN のようなパターン
+                match = re.search(
+                    r"(?:sp|tr)\|([A-Z0-9]+)\|", header
+                )
+                if match:
+                    auto_uniprot = match.group(1)
+
+                uniprot_id = st.text_input(
+                    "UniProt ID",
+                    value=auto_uniprot,
+                    placeholder="P07550",
+                    key=f"uniprot_{protein_name}",
+                )
+
+                if st.button(
+                    "📥 AlphaFold DB から取得",
+                    key=f"af_btn_{protein_name}",
+                ):
+                    if uniprot_id.strip():
+                        with st.spinner(
+                            f"AlphaFold DB から {uniprot_id} を取得中..."
+                        ):
+                            pdb_str = fetch_alphafold_structure(
+                                uniprot_id.strip()
+                            )
+                        if pdb_str:
+                            st.session_state[cache_key] = pdb_str
+                            st.success(
+                                f"AlphaFold DB から構造を取得しました "
+                                f"(UniProt: {uniprot_id})。"
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                f"UniProt ID '{uniprot_id}' の構造が "
+                                f"AlphaFold DB に見つかりませんでした。"
+                            )
+                    else:
+                        st.error("UniProt ID を入力してください。")
+
+            # Stage 3: 手動 PDB アップロード
+            if cache_key not in st.session_state:
+                st.markdown("---")
+                st.markdown("**📁 代替 2: PDB ファイルを手動アップロード**")
+
             uploaded_pdb = st.file_uploader(
                 "PDB file (manual upload — optional)",
                 type=["pdb"],
                 key=f"pdb_upload_{protein_name}",
             )
             if uploaded_pdb:
-                st.session_state[cache_key] = uploaded_pdb.getvalue().decode("utf-8")
+                st.session_state[cache_key] = (
+                    uploaded_pdb.getvalue().decode("utf-8")
+                )
 
-            # 3D 描画
+            # --- 3D 描画 ---
             if cache_key in st.session_state:
                 pdb_data = st.session_state[cache_key]
 
